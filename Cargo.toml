@@ -1,0 +1,29 @@
+[package]
+name = "gpu-bev-node"
+version = "0.1.0"
+edition = "2024"
+default-run = "gpu-bev-node"
+
+[dependencies]
+# Networking & Async
+tokio = { version = "1.0", features = ["full", "rt-multi-thread"] }
+anyhow = "1.0"
+zenoh = "1.0" # Bypassing the broken Bubbaloop wrapper to use pure Zenoh
+
+# Kornia & Compute
+kornia-image = { git = "https://github.com/AnilKumarSingh9856/kornia-rs_repo", branch = "feat/cubecl-backend" }
+kornia-imgproc = { git = "https://github.com/AnilKumarSingh9856/kornia-rs_repo", branch = "feat/cubecl-backend" }
+kornia-io = { git = "https://github.com/AnilKumarSingh9856/kornia-rs_repo", branch = "feat/cubecl-backend" }
+kornia-tensor = { git = "https://github.com/AnilKumarSingh9856/kornia-rs_repo", branch = "feat/cubecl-backend" }
+cubecl = { version = "0.9.0", default-features = false, features = ["wgpu"] }
+bytemuck = "1.24"
+minifb = { version = "0.25", optional = true }
+
+[features]
+default = []
+viewer = ["dep:minifb"]
+
+[[bin]]
+name = "bev_viewer"
+path = "src/bin/bev_viewer.rs"
+required-features = ["viewer"]
