@@ -260,10 +260,17 @@ Notes:
 
 ## Proposal Success Criteria
 
-- Upstream-first outcome: at least one kornia-rs API PR and one backend PR submitted with maintainer-reviewable scope.
-- Systems outcome: persistent VRAM/resource strategy integrated so the measured bottleneck shifts away from per-frame transfer/setup overhead.
-- Correctness outcome: reproducible CPU/GPU/OpenCV parity results with published fixtures and benchmark commands.
-- Integration outcome: Bubbaloop node switched to kornia-rs public API and validated on edge hardware with reported latency.
+Per the Kornia-rs GSoC guidelines, this project defines success through two interconnected deliverables:
+
+**1. A Working Demo Application (The Ultimate Success Metric)**
+
+- A live Bubbaloop Zenoh node executing real-time Bird's-Eye View (BEV) transformations on edge hardware (e.g., NVIDIA Jetson Orin).
+- A reproducible demonstration package, including setup instructions and a recorded video showing the application running end-to-end without blocking the async network runtime.
+
+**2. Upstream Contributions (The Library Impact)**
+
+- **API PR:** Tensor-native warp perspective operation implemented and merged/reviewed in `kornia-imgproc`.
+- **Backend PR:** Hardware-agnostic `CubeCLBackend` integrated into kornia's dispatch system, utilizing persistent VRAM pooling to eliminate the memory-transfer bottlenecks identified in this repository's benchmark.
 
 ## Troubleshooting
 
@@ -280,6 +287,13 @@ This repository already demonstrates core technical feasibility:
 - The GPU output is benchmarked against an OpenCV reference baseline.
 
 The remaining work is primarily upstreaming and integration hardening for kornia-rs and Bubbaloop.
+
+## AI Tooling Disclosure
+
+In compliance with the GSoC 2026 AI Tooling Policy, the following outlines the usage of AI assistants in the preparation of this proposal and Proof of Concept repository:
+
+- **Usage:** LLMs were utilized for research, drafting documentation, and scaffolding boilerplate Rust code. AI was also used as a sparring partner to help identify and refactor concurrency bottlenecks (e.g., migrating to Tokio's `spawn_blocking` to resolve async thread starvation in the Bubbaloop nodes).
+- **Responsibility:** I have manually reviewed, profiled, and benchmarked every line of code in this repository. I take 100% responsibility for the architectural decisions, memory safety, correctness, and licensing of this submission.
 
 ## License
 
