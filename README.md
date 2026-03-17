@@ -184,10 +184,8 @@ Measured results on this machine:
 | Match <=2 intensity diff | 85.69% |
 | Match <=4 intensity diff | 91.34% |
 
-Interpretation:
-
-- The Rust GPU pipeline is functioning end-to-end and produces accurate BEV output against the
-  OpenCV baseline using the same Rust-derived homography model.
+**Interpretation:** The Rust GPU pipeline is functioning end-to-end and produces accurate BEV
+output against the OpenCV baseline using the same Rust-derived homography model.
 
 **Performance Reality Check:** The current GPU benchmark result (5.214 ms) versus CPU/OpenCV
 baseline run (8.33 ms) is only about a 1.6x speedup, which is below expected dedicated GPU gains.
