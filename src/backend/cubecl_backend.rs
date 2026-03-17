@@ -72,6 +72,9 @@ impl CubeCLBackend {
             f32::as_bytes(&matrix).to_vec(),
         ));
 
+        // HACK: Bypassing CubeCL abstraction to access raw WGPU buffers for persistent,
+        // zero-allocation host writes. Replace this path when CubeCL exposes a stable
+        // persistent-buffer update API that avoids direct backend resource extraction.
         let input_resource = client.get_resource(input_handle.clone().binding());
         let input_buffer = input_resource.resource().buffer.clone();
         let input_offset = input_resource.resource().offset;
@@ -137,7 +140,7 @@ impl CubeCLBackend {
 }
 
 impl ImageProcessor for CubeCLBackend {
-    fn warp_perspective(
+    async fn warp_perspective(
         &self,
         input_packed_rgb: &[u32],
         output_packed_rgb: &mut [u32],
@@ -161,10 +164,10 @@ impl ImageProcessor for CubeCLBackend {
             "image dimensions must be non-zero"
         );
 
-        // Phase 1: update per-call homography matrix.
+        // Update per-call homography matrix.
         self.update_matrix(matrix)?;
 
-        // Phase 2: upload packed image to device buffer.
+        // Upload packed image to device buffer.
         let t_h2d = Instant::now();
         anyhow::ensure!(
             self.input_size >= self.input_copy_size_aligned,
@@ -194,10 +197,10 @@ impl ImageProcessor for CubeCLBackend {
         }
 
         self.queue.submit([]);
-        pollster::block_on(self.client.sync())?;
+        self.client.sync().await?;
         let h2d_ms = elapsed_ms(t_h2d);
 
-        // Phase 3: launch the perspective warp kernel.
+        // Launch the perspective warp kernel.
         let t_kernel = Instant::now();
         unsafe {
             perspective_warp_kernel::launch::<WgpuRuntime>(
@@ -225,25 +228,23 @@ impl ImageProcessor for CubeCLBackend {
             )?;
         }
 
-        pollster::block_on(self.client.sync())?;
+        self.client.sync().await?;
         let kernel_ms = elapsed_ms(t_kernel);
 
-        // Phase 4: read output buffer back to host memory.
+        // Read output buffer back to host memory.
         let t_d2h = Instant::now();
-        let mut output_chunks =
-            pollster::block_on(self.client.read_async(vec![self.output_handle.clone()]))?;
+        // NOTE: CubeCL read_async may materialize host-side byte chunks internally.
+        // The hot path below avoids additional Vec allocations in this crate.
+        let mut output_chunks = self
+            .client
+            .read_async(vec![self.output_handle.clone()])
+            .await?;
         let output_bytes = output_chunks.remove(0);
         let d2h_ms = elapsed_ms(t_d2h);
 
-        let output_packed: Vec<u32> = match output_bytes.try_into_vec::<u32>() {
-            Ok(v) => v,
-            Err(bytes) => {
-                let raw = bytes.to_vec();
-                let words = bytemuck::try_cast_slice::<u8, u32>(&raw)
-                    .map_err(|_| anyhow::anyhow!("output buffer has invalid alignment/length"))?;
-                words.to_vec()
-            }
-        };
+        let output_raw: &[u8] = output_bytes.as_ref();
+        let output_packed = bytemuck::try_cast_slice::<u8, u32>(output_raw)
+            .map_err(|_| anyhow::anyhow!("output buffer has invalid alignment/length"))?;
 
         anyhow::ensure!(
             output_packed.len() == self.pixel_count,
@@ -252,7 +253,7 @@ impl ImageProcessor for CubeCLBackend {
             self.pixel_count
         );
 
-        output_packed_rgb.copy_from_slice(&output_packed);
+        output_packed_rgb.copy_from_slice(output_packed);
 
         Ok(WarpRunTimings {
             h2d_ms,

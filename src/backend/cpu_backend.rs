@@ -17,7 +17,7 @@ impl CpuBackend {
 }
 
 impl ImageProcessor for CpuBackend {
-    fn warp_perspective(
+    async fn warp_perspective(
         &self,
         input_packed_rgb: &[u32],
         output_packed_rgb: &mut [u32],

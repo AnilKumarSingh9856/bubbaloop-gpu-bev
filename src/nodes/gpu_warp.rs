@@ -37,15 +37,19 @@ pub fn perspective_warp_kernel(
         let src_y_h = matrix[3] * target_x + matrix[4] * target_y + matrix[5];
         let weight = matrix[6] * target_x + matrix[7] * target_y + matrix[8];
 
-        let src_x_f = src_x_h / weight;
-        let src_y_f = src_y_h / weight;
+        if weight != 0.0 {
+            let src_x_f = src_x_h / weight;
+            let src_y_f = src_y_h / weight;
 
-        let src_x = u32::cast_from(src_x_f);
-        let src_y = u32::cast_from(src_y_f);
+            if src_x_f >= 0.0 && src_y_f >= 0.0 {
+                let src_x = u32::cast_from(src_x_f);
+                let src_y = u32::cast_from(src_y_f);
 
-        if src_x < in_width && src_y < in_height {
-            let in_idx = usize::cast_from(src_y * in_width + src_x);
-            output[out_idx] = input[in_idx];
+                if src_x < in_width && src_y < in_height {
+                    let in_idx = usize::cast_from(src_y * in_width + src_x);
+                    output[out_idx] = input[in_idx];
+                }
+            }
         }
     }
 }

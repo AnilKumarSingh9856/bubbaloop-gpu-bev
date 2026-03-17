@@ -33,11 +33,10 @@ fn looks_like_png(bytes: &[u8]) -> bool {
 /// Pack `RGBRGB...` bytes into `0x00RRGGBB` pixels.
 fn pack_rgb24_to_u32(rgb: &[u8], out: &mut [u32]) {
     debug_assert_eq!(rgb.len(), out.len() * 3);
-    for (i, px) in out.iter_mut().enumerate() {
-        let base = i * 3;
-        let r = rgb[base] as u32;
-        let g = rgb[base + 1] as u32;
-        let b = rgb[base + 2] as u32;
+    for (px, rgb_chunk) in out.iter_mut().zip(rgb.chunks_exact(3)) {
+        let r = rgb_chunk[0] as u32;
+        let g = rgb_chunk[1] as u32;
+        let b = rgb_chunk[2] as u32;
         *px = (r << 16) | (g << 8) | b;
     }
 }
@@ -45,11 +44,10 @@ fn pack_rgb24_to_u32(rgb: &[u8], out: &mut [u32]) {
 /// Unpack `0x00RRGGBB` pixels into `RGBRGB...` bytes.
 fn unpack_u32_to_rgb24(pixels: &[u32], out_rgb: &mut [u8]) {
     debug_assert_eq!(out_rgb.len(), pixels.len() * 3);
-    for (i, &px) in pixels.iter().enumerate() {
-        let base = i * 3;
-        out_rgb[base] = ((px >> 16) & 0xFF) as u8;
-        out_rgb[base + 1] = ((px >> 8) & 0xFF) as u8;
-        out_rgb[base + 2] = (px & 0xFF) as u8;
+    for (rgb_chunk, &px) in out_rgb.chunks_exact_mut(3).zip(pixels.iter()) {
+        rgb_chunk[0] = ((px >> 16) & 0xFF) as u8;
+        rgb_chunk[1] = ((px >> 8) & 0xFF) as u8;
+        rgb_chunk[2] = (px & 0xFF) as u8;
     }
 }
 
@@ -77,7 +75,7 @@ fn avg(values: &[f64]) -> f64 {
 async fn main() -> Result<()> {
     // Read runtime configuration.
     let image_path =
-        std::env::var("BENCH_IMAGE_PATH").unwrap_or_else(|_| "images/frame.jpg".into());
+        std::env::var("BENCH_IMAGE_PATH").unwrap_or_else(|_| "input_images/frame.jpg".into());
     let width = std::env::var("CAM_WIDTH")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -96,13 +94,13 @@ async fn main() -> Result<()> {
         .unwrap_or(50);
     let save_outputs = parse_env_bool("BENCH_SAVE_OUTPUTS", true);
     let opencv_ref_path = std::env::var("BENCH_OPENCV_REF")
-        .unwrap_or_else(|_| "images/opencv_baseline_bev.png".into());
+        .unwrap_or_else(|_| "output_images/opencv_baseline_frame1.png".into());
 
     let img_size = ImageSize { width, height };
     let pixel_count = width * height;
     let expected_rgb_bytes = pixel_count * 3;
 
-    // 1) Load benchmark input image.
+    // Load benchmark input image.
     let mut decoded = Rgb8::<CpuAllocator>::from_size_val(img_size, 0u8, CpuAllocator)
         .map_err(|e| anyhow::anyhow!("image alloc failed: {e:?}"))?;
 
@@ -126,7 +124,7 @@ async fn main() -> Result<()> {
         expected_rgb_bytes
     );
 
-    // 2) Build homography matrix.
+    // Build homography matrix.
     let ipm_cfg = math::homography::IpmConfig::from_env(img_size, img_size);
     let h_matrix = math::homography::bev_out_to_img_homography(&ipm_cfg);
 
@@ -134,27 +132,29 @@ async fn main() -> Result<()> {
     let mut gpu_output = vec![0u32; pixel_count];
     pack_rgb24_to_u32(decoded.as_slice(), &mut input_packed);
 
-    // 3) Initialize GPU backend.
+    // Initialize GPU backend.
     let gpu_backend = CubeCLBackend::new(width, height, h_matrix).await?;
 
-    // 4) Run warmup iterations.
+    // Run warmup iterations.
     for _ in 0..warmup {
         let _ =
-            warp_perspective_packed_rgb(&gpu_backend, &input_packed, &mut gpu_output, &h_matrix)?;
+            warp_perspective_packed_rgb(&gpu_backend, &input_packed, &mut gpu_output, &h_matrix)
+                .await?;
     }
 
-    // 5) Timed benchmark loop.
+    // Run timed benchmark loop.
     let mut gpu_totals = Vec::with_capacity(iters);
 
     for _ in 0..iters {
         let g =
-            warp_perspective_packed_rgb(&gpu_backend, &input_packed, &mut gpu_output, &h_matrix)?;
+            warp_perspective_packed_rgb(&gpu_backend, &input_packed, &mut gpu_output, &h_matrix)
+                .await?;
         gpu_totals.push(g.h2d_ms + g.kernel_ms + g.d2h_ms);
     }
 
     let gpu_avg = avg(&gpu_totals);
 
-    // 6) Load OpenCV reference image and compute accuracy deltas.
+    // Load OpenCV reference image and compute accuracy deltas.
     let mut gpu_rgb = vec![0u8; expected_rgb_bytes];
     unpack_u32_to_rgb24(&gpu_output, &mut gpu_rgb);
 
@@ -213,7 +213,7 @@ async fn main() -> Result<()> {
     let within_2_pct = within_2 as f64 * 100.0 / total;
     let within_4_pct = within_4 as f64 * 100.0 / total;
 
-    // 7) Optionally persist GPU output image.
+    // Optionally persist GPU output image.
     if save_outputs {
         let mut gpu_img = Rgb8::<CpuAllocator>::from_size_val(img_size, 0u8, CpuAllocator)
             .map_err(|e| anyhow::anyhow!("gpu image alloc failed: {e:?}"))?;
@@ -222,8 +222,11 @@ async fn main() -> Result<()> {
         let mut gpu_jpeg = Vec::new();
         jpeg::encode_image_jpeg_rgb8(&gpu_img, 90, &mut gpu_jpeg)
             .map_err(|e| anyhow::anyhow!("gpu jpeg encode failed: {e:?}"))?;
-        std::fs::write("images/bench_output_gpu.jpg", gpu_jpeg)
-            .map_err(|e| anyhow::anyhow!("failed writing images/bench_output_gpu.jpg: {e}"))?;
+        std::fs::create_dir_all("output_images")
+            .map_err(|e| anyhow::anyhow!("failed creating output_images directory: {e}"))?;
+        std::fs::write("output_images/bench_output_gpu.jpg", gpu_jpeg).map_err(|e| {
+            anyhow::anyhow!("failed writing output_images/bench_output_gpu.jpg: {e}")
+        })?;
     }
 
     println!(
@@ -253,7 +256,7 @@ async fn main() -> Result<()> {
         within_4_pct
     );
     if save_outputs {
-        println!("[WARP-BENCH] Saved: images/bench_output_gpu.jpg");
+        println!("[WARP-BENCH] Saved: output_images/bench_output_gpu.jpg");
     }
 
     Ok(())

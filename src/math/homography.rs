@@ -40,24 +40,23 @@ pub struct IpmConfig {
 
 impl IpmConfig {
     pub fn from_env(input_size: ImageSize, output_size: ImageSize) -> Self {
-        let fov_x_deg = env_f32("CAM_FOV_X_DEG").unwrap_or(90.0).clamp(1.0, 179.0);
-        let fov_y_deg = env_f32("CAM_FOV_Y_DEG").unwrap_or(60.0).clamp(1.0, 179.0);
-
         let fx = env_f32("CAM_FX").unwrap_or_else(|| {
-            let fov_x = deg_to_rad(fov_x_deg);
+            let fov_x_deg = env_f32("CAM_FOV_X_DEG").unwrap_or(90.0).clamp(1.0, 179.0);
+            let fov_x = fov_x_deg.to_radians();
             input_size.width as f32 / (2.0 * (fov_x * 0.5).tan())
         });
         let fy = env_f32("CAM_FY").unwrap_or_else(|| {
-            let fov_y = deg_to_rad(fov_y_deg);
+            let fov_y_deg = env_f32("CAM_FOV_Y_DEG").unwrap_or(60.0).clamp(1.0, 179.0);
+            let fov_y = fov_y_deg.to_radians();
             input_size.height as f32 / (2.0 * (fov_y * 0.5).tan())
         });
         let cx = env_f32("CAM_CX").unwrap_or(input_size.width as f32 * 0.5);
         let cy = env_f32("CAM_CY").unwrap_or(input_size.height as f32 * 0.5);
 
         let height_m = env_f32("CAM_HEIGHT_M").unwrap_or(1.5).max(0.01);
-        let roll_rad = deg_to_rad(env_f32("CAM_ROLL_DEG").unwrap_or(0.0));
-        let pitch_rad = deg_to_rad(env_f32("CAM_PITCH_DEG").unwrap_or(-10.0));
-        let yaw_rad = deg_to_rad(env_f32("CAM_YAW_DEG").unwrap_or(0.0));
+        let roll_rad = env_f32("CAM_ROLL_DEG").unwrap_or(0.0).to_radians();
+        let pitch_rad = env_f32("CAM_PITCH_DEG").unwrap_or(-10.0).to_radians();
+        let yaw_rad = env_f32("CAM_YAW_DEG").unwrap_or(0.0).to_radians();
 
         let x_min_m = env_f32("BEV_X_MIN_M").unwrap_or(0.0);
         let x_max_m = env_f32("BEV_X_MAX_M").unwrap_or(30.0);
@@ -94,7 +93,7 @@ impl IpmConfig {
 ///
 /// This implementation is intentionally minimal and assumes a pinhole camera (no distortion).
 pub fn bev_out_to_img_homography(cfg: &IpmConfig) -> [f32; 9] {
-    let k = mat3([
+    let k = [
         cfg.intrinsics.fx,
         0.0,
         cfg.intrinsics.cx,
@@ -104,12 +103,9 @@ pub fn bev_out_to_img_homography(cfg: &IpmConfig) -> [f32; 9] {
         0.0,
         0.0,
         1.0,
-    ]);
+    ];
 
-    // Base alignment (world -> camera) when roll/pitch/yaw are zero.
-    // World: X forward, Y left, Z up
-    // Cam:   x right,  y down, z forward
-    let r_align_wc = mat3([0.0, -1.0, 0.0, 0.0, 0.0, -1.0, 1.0, 0.0, 0.0]);
+    let r_align_wc = [0.0, -1.0, 0.0, 0.0, 0.0, -1.0, 1.0, 0.0, 0.0];
     let r_align_cw = mat3_transpose(r_align_wc);
 
     let r_world = mat3_mul(
@@ -117,18 +113,15 @@ pub fn bev_out_to_img_homography(cfg: &IpmConfig) -> [f32; 9] {
         rot_x(cfg.pose.roll_rad),
     );
 
-    // Camera-to-world orientation and its inverse.
     let r_cw = mat3_mul(r_world, r_align_cw);
     let r_wc = mat3_transpose(r_cw);
 
-    // Camera center in world coordinates.
     let c_world = [0.0f32, 0.0f32, cfg.pose.height_m];
     let t = mat3_vec_mul(r_wc, [-c_world[0], -c_world[1], -c_world[2]]);
 
-    // H_world_to_img = K * [r1 r2 t], for plane Z = 0.
-    let h_plane = mat3([
+    let h_plane = [
         r_wc[0], r_wc[1], t[0], r_wc[3], r_wc[4], t[1], r_wc[6], r_wc[7], t[2],
-    ]);
+    ];
     let h_world_to_img = mat3_mul(k, h_plane);
 
     let w = cfg.output_size.width.max(2) as f32;
@@ -136,10 +129,9 @@ pub fn bev_out_to_img_homography(cfg: &IpmConfig) -> [f32; 9] {
     let x_span = cfg.roi.x_max_m - cfg.roi.x_min_m;
     let y_span = cfg.roi.y_max_m - cfg.roi.y_min_m;
 
-    // Map output pixel (u, v) -> world plane (X, Y) in meters.
     let sx = -x_span / (h - 1.0);
     let sy = -y_span / (w - 1.0);
-    let a_out_to_world = mat3([
+    let a_out_to_world = [
         0.0,
         sx,
         cfg.roi.x_max_m,
@@ -149,7 +141,7 @@ pub fn bev_out_to_img_homography(cfg: &IpmConfig) -> [f32; 9] {
         0.0,
         0.0,
         1.0,
-    ]);
+    ];
 
     let mut h_out_to_img = mat3_mul(h_world_to_img, a_out_to_world);
 
@@ -165,14 +157,6 @@ pub fn bev_out_to_img_homography(cfg: &IpmConfig) -> [f32; 9] {
 
 fn env_f32(key: &str) -> Option<f32> {
     std::env::var(key).ok()?.parse::<f32>().ok()
-}
-
-fn deg_to_rad(deg: f32) -> f32 {
-    deg * core::f32::consts::PI / 180.0
-}
-
-fn mat3(m: [f32; 9]) -> [f32; 9] {
-    m
 }
 
 fn mat3_mul(a: [f32; 9], b: [f32; 9]) -> [f32; 9] {
@@ -201,15 +185,15 @@ fn mat3_vec_mul(a: [f32; 9], v: [f32; 3]) -> [f32; 3] {
 
 fn rot_x(angle_rad: f32) -> [f32; 9] {
     let (s, c) = angle_rad.sin_cos();
-    mat3([1.0, 0.0, 0.0, 0.0, c, -s, 0.0, s, c])
+    [1.0, 0.0, 0.0, 0.0, c, -s, 0.0, s, c]
 }
 
 fn rot_y(angle_rad: f32) -> [f32; 9] {
     let (s, c) = angle_rad.sin_cos();
-    mat3([c, 0.0, s, 0.0, 1.0, 0.0, -s, 0.0, c])
+    [c, 0.0, s, 0.0, 1.0, 0.0, -s, 0.0, c]
 }
 
 fn rot_z(angle_rad: f32) -> [f32; 9] {
     let (s, c) = angle_rad.sin_cos();
-    mat3([c, -s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0])
+    [c, -s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0]
 }

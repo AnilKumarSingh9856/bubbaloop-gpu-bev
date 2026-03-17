@@ -1,3 +1,5 @@
+//! Backend abstraction layer for perspective warp implementations.
+
 mod cpu_backend;
 mod cubecl_backend;
 
@@ -7,12 +9,13 @@ pub use cpu_backend::CpuBackend;
 pub use cubecl_backend::{CubeCLBackend, WarpRunTimings};
 
 /// Image processing backend interface for perspective warping.
+#[allow(async_fn_in_trait)]
 pub trait ImageProcessor {
     /// Warp a packed RGB image using a 3x3 homography matrix.
     ///
     /// The image is represented as a `[height * width]` slice of packed `0x00RRGGBB` pixels.
     /// Implementations are expected to write all output pixels.
-    fn warp_perspective(
+    async fn warp_perspective(
         &self,
         input_packed_rgb: &[u32],
         output_packed_rgb: &mut [u32],

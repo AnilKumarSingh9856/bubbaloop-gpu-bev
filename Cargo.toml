@@ -22,7 +22,6 @@ kornia-tensor = { git = "https://github.com/AnilKumarSingh9856/kornia-rs_repo", 
 cubecl = { version = "0.9.0", default-features = false, features = ["wgpu"] }
 cubecl-runtime = "0.9.0"
 bytemuck = "1.24"
-pollster = "0.4"
 wgpu = "26.0.1"
 minifb = { version = "0.25", optional = true }
 

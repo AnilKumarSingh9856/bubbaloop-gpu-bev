@@ -113,9 +113,9 @@ def rust_bev_out_to_img_homography(width: int, height: int) -> np.ndarray:
 
     return h_out_to_img.astype(np.float32)
 
-# 1. Load the test image from workspace images/
-input_path = Path('images/frame.jpg')
-output_path = Path('images/opencv_baseline_bev.png')
+# 1. Load the test image from workspace input_images/
+input_path = Path('input_images/frame.jpg')
+output_path = Path('output_images/opencv_baseline_frame1.png')
 
 img = cv2.imread(str(input_path))
 if img is None:

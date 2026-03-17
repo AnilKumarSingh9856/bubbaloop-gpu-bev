@@ -20,6 +20,7 @@ use kornia_image::{Image, ImageSize};
 use kornia_io::jpeg;
 use minifb::{Key, Window, WindowOptions};
 use std::borrow::Cow;
+use tokio::task;
 use tokio::time::{Duration, interval};
 use zenoh::Config;
 
@@ -43,16 +44,15 @@ fn frame_dims() -> (usize, usize) {
 
 fn rgb24_to_u32(rgb: &[u8], out: &mut [u32]) {
     debug_assert_eq!(rgb.len(), out.len() * 3);
-    for (i, px) in out.iter_mut().enumerate() {
-        let base = i * 3;
-        let r = rgb[base] as u32;
-        let g = rgb[base + 1] as u32;
-        let b = rgb[base + 2] as u32;
+    for (px, rgb_chunk) in out.iter_mut().zip(rgb.chunks_exact(3)) {
+        let r = rgb_chunk[0] as u32;
+        let g = rgb_chunk[1] as u32;
+        let b = rgb_chunk[2] as u32;
         *px = (r << 16) | (g << 8) | b;
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 1)]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let topic =
         std::env::var("BEV_TOPIC").unwrap_or_else(|_| "gpu-bev-node/frames/birdseye".into());
@@ -87,8 +87,6 @@ async fn main() -> Result<()> {
     window.limit_update_rate(Some(Duration::from_micros(16_000)));
 
     let mut pixels = vec![0u32; width * height];
-    let mut jpeg_decode_scratch =
-        Image::<u8, 3, CpuAllocator>::from_size_val(img_size, 0u8, CpuAllocator)?;
     let mut tick = interval(Duration::from_millis(16));
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
@@ -105,11 +103,32 @@ async fn main() -> Result<()> {
                 let payload = sample.payload().to_bytes();
 
                 let frame_bytes: Cow<'_, [u8]> = if looks_like_jpeg(payload.as_ref()) {
-                    if let Err(e) = jpeg::decode_image_jpeg_rgb8(payload.as_ref(), &mut jpeg_decode_scratch) {
-                        eprintln!("[BEV-VIEWER] WARN: JPEG decode failed: {e:?}");
-                        continue;
-                    }
-                    Cow::Borrowed(jpeg_decode_scratch.as_slice())
+                    let payload_owned = payload.as_ref().to_vec();
+                    let decode_result = task::spawn_blocking(move || -> Result<Vec<u8>> {
+                        let mut decoded = Image::<u8, 3, CpuAllocator>::from_size_val(
+                            img_size,
+                            0u8,
+                            CpuAllocator,
+                        )
+                        .map_err(|e| anyhow::anyhow!("decode image alloc failed: {e:?}"))?;
+                        jpeg::decode_image_jpeg_rgb8(&payload_owned, &mut decoded)
+                            .map_err(|e| anyhow::anyhow!("JPEG decode failed: {e:?}"))?;
+                        Ok(decoded.as_slice().to_vec())
+                    })
+                    .await;
+
+                    let decoded = match decode_result {
+                        Ok(Ok(bytes)) => bytes,
+                        Ok(Err(e)) => {
+                            eprintln!("[BEV-VIEWER] WARN: {e}");
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("[BEV-VIEWER] WARN: decode worker join failed: {e}");
+                            continue;
+                        }
+                    };
+                    Cow::Owned(decoded)
                 } else {
                     if payload.len() != expected_len {
                         eprintln!(
@@ -123,7 +142,7 @@ async fn main() -> Result<()> {
                 };
 
                 rgb24_to_u32(frame_bytes.as_ref(), &mut pixels);
-                window.update_with_buffer(&pixels, width, height)?;
+                task::block_in_place(|| window.update_with_buffer(&pixels, width, height))?;
             }
             _ = tick.tick() => {
                 window.update();

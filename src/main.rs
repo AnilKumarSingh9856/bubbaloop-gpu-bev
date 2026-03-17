@@ -22,8 +22,8 @@
 //! - `BEV_JPEG_QUALITY` (default: `80`)
 
 use anyhow::Result;
-use std::borrow::Cow;
 use std::time::Instant;
+use tokio::task;
 use tokio::time::{Duration, sleep};
 use zenoh::Config;
 
@@ -214,11 +214,10 @@ impl PipelineBench {
 /// Pack `RGBRGB...` bytes into `0x00RRGGBB` pixels.
 fn pack_rgb24_to_u32(rgb: &[u8], out: &mut [u32]) {
     debug_assert_eq!(rgb.len(), out.len() * 3);
-    for (i, px) in out.iter_mut().enumerate() {
-        let base = i * 3;
-        let r = rgb[base] as u32;
-        let g = rgb[base + 1] as u32;
-        let b = rgb[base + 2] as u32;
+    for (px, rgb_chunk) in out.iter_mut().zip(rgb.chunks_exact(3)) {
+        let r = rgb_chunk[0] as u32;
+        let g = rgb_chunk[1] as u32;
+        let b = rgb_chunk[2] as u32;
         *px = (r << 16) | (g << 8) | b;
     }
 }
@@ -226,11 +225,10 @@ fn pack_rgb24_to_u32(rgb: &[u8], out: &mut [u32]) {
 /// Unpack `0x00RRGGBB` pixels into `RGBRGB...` bytes.
 fn unpack_u32_to_rgb24(pixels: &[u32], out_rgb: &mut [u8]) {
     debug_assert_eq!(out_rgb.len(), pixels.len() * 3);
-    for (i, &px) in pixels.iter().enumerate() {
-        let base = i * 3;
-        out_rgb[base] = ((px >> 16) & 0xFF) as u8;
-        out_rgb[base + 1] = ((px >> 8) & 0xFF) as u8;
-        out_rgb[base + 2] = (px & 0xFF) as u8;
+    for (rgb_chunk, &px) in out_rgb.chunks_exact_mut(3).zip(pixels.iter()) {
+        rgb_chunk[0] = ((px >> 16) & 0xFF) as u8;
+        rgb_chunk[1] = ((px >> 8) & 0xFF) as u8;
+        rgb_chunk[2] = (px & 0xFF) as u8;
     }
 }
 
@@ -293,14 +291,16 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to create publisher: {}", e))?;
 
     // Allocate scratch image for decode and encode stages.
-    let mut jpeg_decode_scratch = Rgb8::<CpuAllocator>::from_size_val(img_size, 0u8, CpuAllocator)
-        .map_err(|e| anyhow::anyhow!("Image alloc failed: {:?}", e))?;
-    let mut jpeg_encode_buffer = Vec::new();
+    let mut jpeg_decode_scratch = Some(
+        Rgb8::<CpuAllocator>::from_size_val(img_size, 0u8, CpuAllocator)
+            .map_err(|e| anyhow::anyhow!("Image alloc failed: {:?}", e))?,
+    );
+    let mut jpeg_encode_buffer = Vec::with_capacity(expected_rgb_bytes);
     let mut input_packed = vec![0u32; pixel_count];
     let mut output_packed = vec![0u32; pixel_count];
 
     loop {
-        // 1) Receive one frame payload.
+        // Receive one frame payload.
         let sample = match subscriber.recv_async().await {
             Ok(s) => s,
             Err(e) => {
@@ -312,23 +312,100 @@ async fn main() -> Result<()> {
 
         let payload = sample.payload().to_bytes();
 
-        // 2) Decode payload into RGB bytes.
+        // Decode payload into RGB bytes.
         let t_decode = Instant::now();
-        let frame_bytes: Cow<'_, [u8]> = if looks_like_jpeg(payload.as_ref()) {
-            if let Err(e) = jpeg::decode_image_jpeg_rgb8(payload.as_ref(), &mut jpeg_decode_scratch)
-            {
-                eprintln!("[GPU-BEV] WARN: JPEG decode failed: {e:?}");
-                continue;
+        let frame_bytes: &[u8] = if looks_like_jpeg(payload.as_ref()) {
+            let payload_owned = payload.as_ref().to_vec();
+            let decoded = jpeg_decode_scratch
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("decode scratch buffer missing"))?;
+            let decode_task = task::spawn_blocking(move || -> Result<Rgb8<CpuAllocator>> {
+                let mut decoded = decoded;
+                jpeg::decode_image_jpeg_rgb8(&payload_owned, &mut decoded)
+                    .map_err(|e| anyhow::anyhow!("JPEG decode failed: {e:?}"))?;
+                Ok(decoded)
+            })
+            .await;
+
+            match decode_task {
+                Ok(Ok(decoded)) => {
+                    jpeg_decode_scratch = Some(decoded);
+                    jpeg_decode_scratch
+                        .as_ref()
+                        .expect("decode scratch set")
+                        .as_slice()
+                }
+                Ok(Err(e)) => {
+                    jpeg_decode_scratch = Some(
+                        Rgb8::<CpuAllocator>::from_size_val(img_size, 0u8, CpuAllocator).map_err(
+                            |alloc_err| {
+                                anyhow::anyhow!(
+                                    "JPEG decode failed: {e}; alloc failed: {alloc_err:?}"
+                                )
+                            },
+                        )?,
+                    );
+                    eprintln!("[GPU-BEV] WARN: {e}");
+                    continue;
+                }
+                Err(e) => {
+                    jpeg_decode_scratch = Some(
+                        Rgb8::<CpuAllocator>::from_size_val(img_size, 0u8, CpuAllocator)
+                            .map_err(|alloc_err| {
+                                anyhow::anyhow!("JPEG decode worker join failed: {e}; alloc failed: {alloc_err:?}")
+                            })?,
+                    );
+                    eprintln!("[GPU-BEV] WARN: JPEG decode worker join failed: {e}");
+                    continue;
+                }
             }
-            Cow::Borrowed(jpeg_decode_scratch.as_slice())
         } else if looks_like_png(payload.as_ref()) {
-            if let Err(e) = png::decode_image_png_rgb8(payload.as_ref(), &mut jpeg_decode_scratch) {
-                eprintln!(
-                    "[GPU-BEV] WARN: PNG decode failed: {e:?} (check CAM_WIDTH/CAM_HEIGHT match the PNG resolution)"
-                );
-                continue;
+            let payload_owned = payload.as_ref().to_vec();
+            let decoded = jpeg_decode_scratch
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("decode scratch buffer missing"))?;
+            let decode_task = task::spawn_blocking(move || -> Result<Rgb8<CpuAllocator>> {
+                let mut decoded = decoded;
+                png::decode_image_png_rgb8(&payload_owned, &mut decoded)
+                    .map_err(|e| anyhow::anyhow!("PNG decode failed: {e:?}"))?;
+                Ok(decoded)
+            })
+            .await;
+
+            match decode_task {
+                Ok(Ok(decoded)) => {
+                    jpeg_decode_scratch = Some(decoded);
+                    jpeg_decode_scratch
+                        .as_ref()
+                        .expect("decode scratch set")
+                        .as_slice()
+                }
+                Ok(Err(e)) => {
+                    jpeg_decode_scratch = Some(
+                        Rgb8::<CpuAllocator>::from_size_val(img_size, 0u8, CpuAllocator).map_err(
+                            |alloc_err| {
+                                anyhow::anyhow!(
+                                    "PNG decode failed: {e}; alloc failed: {alloc_err:?}"
+                                )
+                            },
+                        )?,
+                    );
+                    eprintln!(
+                        "[GPU-BEV] WARN: {e} (check CAM_WIDTH/CAM_HEIGHT match the PNG resolution)"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    jpeg_decode_scratch = Some(
+                        Rgb8::<CpuAllocator>::from_size_val(img_size, 0u8, CpuAllocator)
+                            .map_err(|alloc_err| {
+                                anyhow::anyhow!("PNG decode worker join failed: {e}; alloc failed: {alloc_err:?}")
+                            })?,
+                    );
+                    eprintln!("[GPU-BEV] WARN: PNG decode worker join failed: {e}");
+                    continue;
+                }
             }
-            Cow::Borrowed(jpeg_decode_scratch.as_slice())
         } else {
             if payload.len() != expected_rgb_bytes {
                 eprintln!(
@@ -338,7 +415,7 @@ async fn main() -> Result<()> {
                 );
                 continue;
             }
-            payload
+            payload.as_ref()
         };
         let jpeg_decode_ms = ms(t_decode);
 
@@ -351,18 +428,20 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        // 3) Pack RGB bytes into backend input format.
+        // Pack RGB bytes into backend input format.
         let t_pack = Instant::now();
-        pack_rgb24_to_u32(frame_bytes.as_ref(), &mut input_packed);
+        pack_rgb24_to_u32(frame_bytes, &mut input_packed);
         let pack_ms = ms(t_pack);
 
-        // 4) Execute perspective warp.
+        // Execute perspective warp.
         let run_timings = match warp_perspective_packed_rgb(
             &backend,
             &input_packed,
             &mut output_packed,
             &h_matrix_cpu,
-        ) {
+        )
+        .await
+        {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("[GPU-BEV] WARN: backend warp failed: {e}");
@@ -374,34 +453,83 @@ async fn main() -> Result<()> {
         let kernel_ms = run_timings.kernel_ms;
         let d2h_ms = run_timings.d2h_ms;
 
-        // 5) Unpack backend output into RGB bytes.
+        // Unpack backend output into RGB bytes.
         let t_unpack = Instant::now();
-        unpack_u32_to_rgb24(&output_packed, jpeg_decode_scratch.as_slice_mut());
+        unpack_u32_to_rgb24(
+            &output_packed,
+            jpeg_decode_scratch
+                .as_mut()
+                .expect("decode scratch available")
+                .as_slice_mut(),
+        );
         let unpack_ms = ms(t_unpack);
 
-        // 6) Encode outbound payload and publish.
+        // Encode outbound payload and publish.
         let mut jpeg_encode_ms = 0.0;
-        let publish_payload: Vec<u8> = if publish_jpeg {
+        if publish_jpeg {
             let t_encode = Instant::now();
-            jpeg_encode_buffer.clear();
-            if let Err(e) = jpeg::encode_image_jpeg_rgb8(
-                &jpeg_decode_scratch,
-                jpeg_quality,
-                &mut jpeg_encode_buffer,
-            ) {
-                eprintln!("[GPU-BEV] WARN: JPEG encode failed: {e:?}");
+            let encode_quality = jpeg_quality;
+            let encode_buffer = std::mem::take(&mut jpeg_encode_buffer);
+            let encode_img = jpeg_decode_scratch
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("encode scratch buffer missing"))?;
+            let encode_task =
+                task::spawn_blocking(move || -> Result<(Vec<u8>, Rgb8<CpuAllocator>)> {
+                    let mut out = encode_buffer;
+                    out.clear();
+                    jpeg::encode_image_jpeg_rgb8(&encode_img, encode_quality, &mut out)
+                        .map_err(|e| anyhow::anyhow!("JPEG encode failed: {e:?}"))?;
+                    Ok((out, encode_img))
+                })
+                .await;
+
+            let (encoded, decode_img) = match encode_task {
+                Ok(Ok((buffer, decode_img))) => (buffer, decode_img),
+                Ok(Err(e)) => {
+                    jpeg_decode_scratch = Some(
+                        Rgb8::<CpuAllocator>::from_size_val(img_size, 0u8, CpuAllocator).map_err(
+                            |alloc_err| {
+                                anyhow::anyhow!(
+                                    "JPEG encode failed: {e}; alloc failed: {alloc_err:?}"
+                                )
+                            },
+                        )?,
+                    );
+                    jpeg_encode_buffer = Vec::with_capacity(expected_rgb_bytes);
+                    eprintln!("[GPU-BEV] WARN: {e}");
+                    continue;
+                }
+                Err(e) => {
+                    jpeg_decode_scratch = Some(
+                        Rgb8::<CpuAllocator>::from_size_val(img_size, 0u8, CpuAllocator)
+                            .map_err(|alloc_err| {
+                                anyhow::anyhow!("JPEG encode worker join failed: {e}; alloc failed: {alloc_err:?}")
+                            })?,
+                    );
+                    jpeg_encode_buffer = Vec::with_capacity(expected_rgb_bytes);
+                    eprintln!("[GPU-BEV] WARN: JPEG encode worker join failed: {e}");
+                    continue;
+                }
+            };
+            jpeg_decode_scratch = Some(decode_img);
+            jpeg_encode_ms = ms(t_encode);
+            if let Err(e) = publisher.put(encoded.as_slice()).await {
+                eprintln!("[GPU-BEV] WARN: Zenoh publish failed: {e}");
+                sleep(Duration::from_millis(10)).await;
+                jpeg_encode_buffer = encoded;
                 continue;
             }
-            jpeg_encode_ms = ms(t_encode);
-            jpeg_encode_buffer.clone()
+            jpeg_encode_buffer = encoded;
         } else {
-            jpeg_decode_scratch.as_slice().to_vec()
-        };
-
-        if let Err(e) = publisher.put(publish_payload).await {
-            eprintln!("[GPU-BEV] WARN: Zenoh publish failed: {e}");
-            sleep(Duration::from_millis(10)).await;
-            continue;
+            let raw_rgb = jpeg_decode_scratch
+                .as_ref()
+                .expect("decode scratch available")
+                .as_slice();
+            if let Err(e) = publisher.put(raw_rgb).await {
+                eprintln!("[GPU-BEV] WARN: Zenoh publish failed: {e}");
+                sleep(Duration::from_millis(10)).await;
+                continue;
+            }
         }
 
         if !bench.enabled {
