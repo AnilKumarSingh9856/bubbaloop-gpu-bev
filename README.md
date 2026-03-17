@@ -92,6 +92,23 @@ src/
 - Optional desktop session for viewer binary
 - Python environment with `opencv-python` and `numpy` for OpenCV reference generation
 
+## Setup
+
+```bash
+# Clone
+git clone https://github.com/AnilKumarSingh9856/bubbaloop-gpu-bev.git
+cd bubbaloop-gpu-bev
+
+# Install Rust toolchain (if not already installed)
+rustup default stable
+
+# Create Python virtual environment for OpenCV benchmark tooling
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install opencv-python numpy
+```
+
 ## Build and Run
 
 ```bash
