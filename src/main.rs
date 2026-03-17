@@ -21,32 +21,26 @@
 //! - `BEV_PUBLISH_JPEG` (default: `true`)
 //! - `BEV_JPEG_QUALITY` (default: `80`)
 
-mod math;
-mod nodes;
-
 use anyhow::Result;
 use std::borrow::Cow;
-use std::num::NonZeroU64;
 use std::time::Instant;
 use tokio::time::{Duration, sleep};
 use zenoh::Config;
 
-use cubecl::prelude::*;
-use nodes::gpu_warp::perspective_warp_kernel;
-
-use cubecl::{
-    Runtime,
-    wgpu::{AutoGraphicsApi, RuntimeOptions, WgpuDevice, WgpuRuntime, init_setup_async},
-};
+use gpu_bev_node::backend::CubeCLBackend;
+use gpu_bev_node::imgproc::warp_perspective_packed_rgb;
+use gpu_bev_node::math;
 use kornia_image::ImageSize;
 use kornia_image::allocator::CpuAllocator;
 use kornia_image::color_spaces::Rgb8;
 use kornia_io::{jpeg, png};
 
+/// Return true when the payload starts with the JPEG SOI marker.
 fn looks_like_jpeg(bytes: &[u8]) -> bool {
     bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xD8
 }
 
+/// Return true when the payload starts with the PNG signature.
 fn looks_like_png(bytes: &[u8]) -> bool {
     bytes.len() >= 8
         && bytes[0] == 0x89
@@ -59,6 +53,7 @@ fn looks_like_png(bytes: &[u8]) -> bool {
         && bytes[7] == 0x0A
 }
 
+/// Parse a boolean environment variable with common true/false aliases.
 fn parse_env_bool(key: &str, default: bool) -> bool {
     match std::env::var(key) {
         Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
@@ -70,6 +65,7 @@ fn parse_env_bool(key: &str, default: bool) -> bool {
     }
 }
 
+/// Parse a JPEG quality value from env and clamp to 0..=100.
 fn parse_env_u8(key: &str, default: u8) -> u8 {
     std::env::var(key)
         .ok()
@@ -78,6 +74,7 @@ fn parse_env_u8(key: &str, default: u8) -> u8 {
         .min(100)
 }
 
+/// Parse an unsigned integer environment variable.
 fn parse_env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
@@ -85,10 +82,12 @@ fn parse_env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Convert elapsed time to milliseconds.
 fn ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
+/// Aggregated statistics for one measured stage.
 #[derive(Clone, Copy, Debug, Default)]
 struct BenchStats {
     count: u64,
@@ -112,6 +111,7 @@ impl BenchStats {
     }
 }
 
+/// Rolling benchmark state for pipeline stage timing.
 #[derive(Debug)]
 struct PipelineBench {
     enabled: bool,
@@ -129,6 +129,7 @@ struct PipelineBench {
     total: BenchStats,
 }
 
+/// Per-frame stage timing values.
 struct FrameTimings {
     jpeg_decode_ms: f64,
     pack_ms: f64,
@@ -210,6 +211,7 @@ impl PipelineBench {
     }
 }
 
+/// Pack `RGBRGB...` bytes into `0x00RRGGBB` pixels.
 fn pack_rgb24_to_u32(rgb: &[u8], out: &mut [u32]) {
     debug_assert_eq!(rgb.len(), out.len() * 3);
     for (i, px) in out.iter_mut().enumerate() {
@@ -221,6 +223,7 @@ fn pack_rgb24_to_u32(rgb: &[u8], out: &mut [u32]) {
     }
 }
 
+/// Unpack `0x00RRGGBB` pixels into `RGBRGB...` bytes.
 fn unpack_u32_to_rgb24(pixels: &[u32], out_rgb: &mut [u8]) {
     debug_assert_eq!(out_rgb.len(), pixels.len() * 3);
     for (i, &px) in pixels.iter().enumerate() {
@@ -233,6 +236,7 @@ fn unpack_u32_to_rgb24(pixels: &[u32], out_rgb: &mut [u8]) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Source and destination topic names.
     let source_topic = "camera/front/frames";
     let dest_topic = "gpu-bev-node/frames/birdseye";
     let img_size = ImageSize {
@@ -247,6 +251,7 @@ async fn main() -> Result<()> {
     };
 
     println!("[GPU-BEV] Initializing pure Zenoh node...");
+    // Initialize Zenoh session from environment configuration.
     let config = match Config::from_env() {
         Ok(c) => c,
         Err(e) => {
@@ -260,26 +265,20 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to open Zenoh session: {}", e))?;
 
-    println!("[GPU-BEV] Initializing WGPU/CubeCL hardware...");
-    let device = WgpuDevice::default();
-    let setup = init_setup_async::<AutoGraphicsApi>(&device, RuntimeOptions::default()).await;
-    let client = WgpuRuntime::client(&device);
-    let queue = setup.queue;
-    println!("[GPU-BEV] Hardware bound successfully.");
-
     let pixel_count = img_size.width * img_size.height;
     let expected_rgb_bytes = pixel_count * 3;
-    let expected_gpu_bytes = pixel_count * std::mem::size_of::<u32>();
     let publish_jpeg = parse_env_bool("BEV_PUBLISH_JPEG", true);
     let jpeg_quality = parse_env_u8("BEV_JPEG_QUALITY", 80);
     let loop_delay_ms = parse_env_u64("BEV_LOOP_DELAY_MS", 16);
     let mut bench = PipelineBench::from_env();
 
+    // Build inverse-perspective homography matrix.
     let ipm_cfg = math::homography::IpmConfig::from_env(img_size, img_size);
     let h_matrix_cpu = math::homography::bev_out_to_img_homography(&ipm_cfg);
-    let h_matrix_handle = client.create(cubecl::bytes::Bytes::from_bytes_vec(
-        f32::as_bytes(&h_matrix_cpu).to_vec(),
-    ));
+
+    println!("[GPU-BEV] Initializing WGPU/CubeCL backend...");
+    let backend = CubeCLBackend::new(img_size.width, img_size.height, h_matrix_cpu).await?;
+    println!("[GPU-BEV] Hardware bound successfully.");
 
     println!("[GPU-BEV] Node running. Subscribing to: {}", source_topic);
 
@@ -293,32 +292,15 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create publisher: {}", e))?;
 
-    let input_handle = client.empty(expected_gpu_bytes);
-    let output_handle = client.empty(expected_gpu_bytes);
-    let input_resource = client.get_resource(input_handle.clone().binding());
-    let input_buffer = input_resource.resource().buffer.clone();
-    let input_offset = input_resource.resource().offset;
-    let input_size = input_resource.resource().size;
-    let input_copy_size_aligned = (expected_gpu_bytes as u64).next_multiple_of(4u64);
-
-    let img_shape = [img_size.height, img_size.width];
-    let img_strides = [img_size.width, 1usize];
-    let mat_shape = [9usize];
-    let mat_strides = [1usize];
-    let cube_dim = CubeDim::new_2d(16, 16);
-    let width_u32 = img_size.width as u32;
-    let height_u32 = img_size.height as u32;
-    let cube_count = CubeCount::new_2d(
-        width_u32.div_ceil(cube_dim.x),
-        height_u32.div_ceil(cube_dim.y),
-    );
-
+    // Allocate scratch image for decode and encode stages.
     let mut jpeg_decode_scratch = Rgb8::<CpuAllocator>::from_size_val(img_size, 0u8, CpuAllocator)
         .map_err(|e| anyhow::anyhow!("Image alloc failed: {:?}", e))?;
     let mut jpeg_encode_buffer = Vec::new();
     let mut input_packed = vec![0u32; pixel_count];
+    let mut output_packed = vec![0u32; pixel_count];
 
     loop {
+        // 1) Receive one frame payload.
         let sample = match subscriber.recv_async().await {
             Ok(s) => s,
             Err(e) => {
@@ -329,6 +311,8 @@ async fn main() -> Result<()> {
         };
 
         let payload = sample.payload().to_bytes();
+
+        // 2) Decode payload into RGB bytes.
         let t_decode = Instant::now();
         let frame_bytes: Cow<'_, [u8]> = if looks_like_jpeg(payload.as_ref()) {
             if let Err(e) = jpeg::decode_image_jpeg_rgb8(payload.as_ref(), &mut jpeg_decode_scratch)
@@ -367,109 +351,35 @@ async fn main() -> Result<()> {
             continue;
         }
 
+        // 3) Pack RGB bytes into backend input format.
         let t_pack = Instant::now();
         pack_rgb24_to_u32(frame_bytes.as_ref(), &mut input_packed);
         let pack_ms = ms(t_pack);
 
-        let t_h2d = Instant::now();
-        if input_size < input_copy_size_aligned {
-            eprintln!(
-                "[GPU-BEV] WARN: input buffer too small: got {input_size} bytes, need {input_copy_size_aligned} bytes"
-            );
-            continue;
-        }
-
-        let input_bytes = bytemuck::cast_slice::<u32, u8>(&input_packed);
-        if input_copy_size_aligned == expected_gpu_bytes as u64 {
-            queue.write_buffer(&input_buffer, input_offset, input_bytes);
-        } else {
-            let Some(mut view) = queue.write_buffer_with(
-                &input_buffer,
-                input_offset,
-                NonZeroU64::new(input_copy_size_aligned)
-                    .expect("input_copy_size_aligned must be non-zero"),
-            ) else {
-                eprintln!(
-                    "[GPU-BEV] WARN: failed to stage-write {input_copy_size_aligned} bytes into input buffer"
-                );
-                continue;
-            };
-            view[0..input_bytes.len()].copy_from_slice(input_bytes);
-            view[input_bytes.len()..].fill(0u8);
-        }
-
-        if bench.enabled {
-            queue.submit([]);
-            if let Err(e) = client.sync().await {
-                eprintln!("[GPU-BEV] WARN: H2D sync failed: {e:?}");
-                sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-        }
-        let h2d_ms = ms(t_h2d);
-
-        let t_kernel = Instant::now();
-        unsafe {
-            if let Err(e) = perspective_warp_kernel::launch::<WgpuRuntime>(
-                &client,
-                cube_count.clone(),
-                cube_dim,
-                TensorArg::from_raw_parts::<u32>(&input_handle, &img_strides, &img_shape, 1),
-                TensorArg::from_raw_parts::<u32>(&output_handle, &img_strides, &img_shape, 1),
-                TensorArg::from_raw_parts::<f32>(&h_matrix_handle, &mat_strides, &mat_shape, 1),
-            ) {
-                eprintln!("[GPU-BEV] WARN: perspective_warp_kernel launch failed: {e}");
-                sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-        }
-
-        if bench.enabled
-            && let Err(e) = client.sync().await
-        {
-            eprintln!("[GPU-BEV] WARN: kernel sync failed: {e:?}");
-            sleep(Duration::from_millis(50)).await;
-            continue;
-        }
-        let kernel_ms = ms(t_kernel);
-
-        let t_d2h = Instant::now();
-        let mut output_chunks = match client.read_async(vec![output_handle.clone()]).await {
-            Ok(v) => v,
+        // 4) Execute perspective warp.
+        let run_timings = match warp_perspective_packed_rgb(
+            &backend,
+            &input_packed,
+            &mut output_packed,
+            &h_matrix_cpu,
+        ) {
+            Ok(t) => t,
             Err(e) => {
-                eprintln!("[GPU-BEV] WARN: failed to read VRAM buffer: {e}");
-                sleep(Duration::from_millis(10)).await;
+                eprintln!("[GPU-BEV] WARN: backend warp failed: {e}");
+                sleep(Duration::from_millis(50)).await;
                 continue;
             }
         };
-        let output_bytes = output_chunks.remove(0);
-        let d2h_ms = ms(t_d2h);
+        let h2d_ms = run_timings.h2d_ms;
+        let kernel_ms = run_timings.kernel_ms;
+        let d2h_ms = run_timings.d2h_ms;
 
-        let output_packed = match output_bytes.try_into_vec::<u32>() {
-            Ok(v) => v,
-            Err(bytes) => {
-                let raw = bytes.to_vec();
-                let Ok(words) = bytemuck::try_cast_slice::<u8, u32>(&raw) else {
-                    eprintln!("[GPU-BEV] WARN: output buffer has invalid alignment/length");
-                    continue;
-                };
-                words.to_vec()
-            }
-        };
-
-        if output_packed.len() != pixel_count {
-            eprintln!(
-                "[GPU-BEV] WARN: output pixel count mismatch: got {}, expected {}",
-                output_packed.len(),
-                pixel_count
-            );
-            continue;
-        }
-
+        // 5) Unpack backend output into RGB bytes.
         let t_unpack = Instant::now();
         unpack_u32_to_rgb24(&output_packed, jpeg_decode_scratch.as_slice_mut());
         let unpack_ms = ms(t_unpack);
 
+        // 6) Encode outbound payload and publish.
         let mut jpeg_encode_ms = 0.0;
         let publish_payload: Vec<u8> = if publish_jpeg {
             let t_encode = Instant::now();

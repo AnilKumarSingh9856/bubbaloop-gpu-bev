@@ -11,12 +11,19 @@ anyhow = "1.0"
 zenoh = "1.0" # Bypassing the broken Bubbaloop wrapper to use pure Zenoh
 
 # Kornia & Compute
+# kornia-image: image containers and image-size/types used in node and benchmark flows.
 kornia-image = { git = "https://github.com/AnilKumarSingh9856/kornia-rs_repo", branch = "feat/cubecl-backend" }
+# kornia-imgproc: target crate for upstreaming warp-perspective operation and backend dispatch.
 kornia-imgproc = { git = "https://github.com/AnilKumarSingh9856/kornia-rs_repo", branch = "feat/cubecl-backend" }
+# kornia-io: JPEG/PNG decode-encode utilities used by runtime and benchmark tools.
 kornia-io = { git = "https://github.com/AnilKumarSingh9856/kornia-rs_repo", branch = "feat/cubecl-backend" }
+# kornia-tensor: target crate for tensor-native API/layout integration in upstream PRs.
 kornia-tensor = { git = "https://github.com/AnilKumarSingh9856/kornia-rs_repo", branch = "feat/cubecl-backend" }
 cubecl = { version = "0.9.0", default-features = false, features = ["wgpu"] }
+cubecl-runtime = "0.9.0"
 bytemuck = "1.24"
+pollster = "0.4"
+wgpu = "26.0.1"
 minifb = { version = "0.25", optional = true }
 
 [features]
