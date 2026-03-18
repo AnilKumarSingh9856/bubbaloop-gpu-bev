@@ -107,29 +107,187 @@ src/
 
 ## Prerequisites
 
-- Rust (edition 2024) via rustup
-- GPU drivers/runtime compatible with wgpu backend
-- Optional desktop session for viewer binary
-- Python environment with `opencv-python` and `numpy` for OpenCV reference generation
+- Git
+- Rust (stable, edition 2024) via rustup
+- C/C++ build toolchain (needed by Rust crates during compilation)
+- Python 3.10+ with venv support (for benchmark helper script)
+- GPU driver/runtime compatible with wgpu
+- Optional desktop session for `bev_viewer` binary
 
-## Setup
+## Setup (Step by Step for Each OS)
+
+Follow one OS section completely, then continue to Build and Run.
+
+### Linux (Ubuntu/Debian)
+
+1. Install system packages:
 
 ```bash
-# Clone
+sudo apt update
+sudo apt install -y \
+  git curl build-essential pkg-config cmake clang libssl-dev \
+  python3 python3-venv python3-pip \
+  libx11-dev libxrandr-dev libxcursor-dev libxi-dev \
+  libvulkan1 vulkan-tools mesa-vulkan-drivers
+```
+
+2. Install Rust:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+rustup default stable
+```
+
+3. Clone project:
+
+```bash
 git clone https://github.com/AnilKumarSingh9856/bubbaloop-gpu-bev.git
 cd bubbaloop-gpu-bev
+```
 
-# Install Rust toolchain (if not already installed)
-rustup default stable
+4. Create Python virtual environment and install benchmark dependencies:
 
-# Create Python virtual environment for OpenCV benchmark tooling
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install opencv-python numpy
 ```
 
+5. Verify setup:
+
+```bash
+rustc --version
+cargo --version
+python --version
+vulkaninfo | head -n 20
+```
+
+### macOS (MacBook)
+
+1. Install Xcode command line tools:
+
+```bash
+xcode-select --install
+```
+
+2. Install Homebrew (if missing), then required packages:
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+brew install git python pkg-config cmake
+```
+
+3. Install Rust:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+rustup default stable
+```
+
+4. Clone project:
+
+```bash
+git clone https://github.com/AnilKumarSingh9856/bubbaloop-gpu-bev.git
+cd bubbaloop-gpu-bev
+```
+
+5. Create Python virtual environment and install benchmark dependencies:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install opencv-python numpy
+```
+
+6. Verify setup:
+
+```bash
+rustc --version
+cargo --version
+python3 --version
+```
+
+Notes:
+
+- wgpu uses Metal on macOS; no separate Vulkan installation is required.
+- If you use Apple Silicon, run in a native arm64 terminal for best compatibility/performance.
+
+### Windows 10/11 (PowerShell)
+
+1. Install required tools (run PowerShell as Administrator):
+
+```powershell
+winget install --id Git.Git -e
+winget install --id Rustlang.Rustup -e
+winget install --id Python.Python.3.12 -e
+```
+
+2. Install Visual C++ build tools:
+
+- Install "Visual Studio 2022 Build Tools" from Microsoft.
+- During install, select the workload: "Desktop development with C++".
+
+3. Restart PowerShell, then set Rust stable as default:
+
+```powershell
+rustup default stable
+```
+
+4. Clone project:
+
+```powershell
+git clone https://github.com/AnilKumarSingh9856/bubbaloop-gpu-bev.git
+cd bubbaloop-gpu-bev
+```
+
+5. Create Python virtual environment and install benchmark dependencies:
+
+```powershell
+# Allow local venv activation scripts in PowerShell (one-time for current user)
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install opencv-python numpy
+```
+
+6. Verify setup:
+
+```powershell
+rustc --version
+cargo --version
+python --version
+```
+
+Notes:
+
+- Keep your GPU driver updated (NVIDIA/AMD/Intel) so wgpu can access modern graphics APIs.
+- If viewer build fails, ensure Desktop C++ tools are installed and you are using a normal desktop session.
+
+## Quick First Build Check (All OS)
+
+```bash
+cargo check
+```
+
+If this command succeeds, the project dependencies are installed correctly.
+
 ## Build and Run
+
+The run commands below use Bash-style environment variables.
+
+- Linux/macOS: run commands exactly as shown.
+- Windows PowerShell: set variables first, then run cargo. Example:
+
+```powershell
+$env:CAM_WIDTH="1280"
+$env:CAM_HEIGHT="720"
+cargo run --release --bin gpu-bev-node
+```
 
 ```bash
 # Build sanity check
@@ -164,6 +322,15 @@ Step 1: Generate OpenCV reference output:
 
 ```bash
 source .venv/bin/activate
+python tools/verify_accuracy.py
+```
+
+Windows PowerShell equivalent:
+
+```powershell
+# Allow local venv activation scripts in PowerShell (one-time for current user)
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+.\.venv\Scripts\Activate.ps1
 python tools/verify_accuracy.py
 ```
 
