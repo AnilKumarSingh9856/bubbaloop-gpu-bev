@@ -15,6 +15,26 @@ CubeCL. This repository serves as the staging ground for the library API and use
 Bubbaloop Zenoh node exclusively as a real-world integration test to validate end-to-end
 latency on edge hardware.
 
+## Project Abstract
+
+High-performance edge vision in robotics is still dominated by CUDA-first pipelines, which
+limits portability across heterogeneous hardware and slows adoption in the Rust ecosystem.
+This project proposes a hardware-agnostic GPU backend for kornia-rs using CubeCL/WGPU,
+including persistent VRAM pooling and async-safe execution for operations such as
+`warp_perspective`. The final deliverable is a reusable upstream library backend validated by
+an end-to-end Zenoh/Bubbaloop BEV pipeline suitable for real robotics deployment.
+
+## Problem Statement
+
+Current robotics vision stacks typically force one of three trade-offs:
+
+- Python pipelines are fast to iterate, but often struggle with deterministic low-latency edge deployment.
+- C++/CUDA pipelines can be high performance, but are frequently vendor-specific and harder to maintain safely.
+- Existing Rust robotics projects often keep middleware and GPU compute in app-specific silos instead of reusable upstream libraries.
+
+This project targets the missing middle: a reusable, memory-safe, hardware-agnostic GPU
+backend for Rust computer vision that integrates cleanly with lightweight middleware such as Zenoh.
+
 ## Architecture
 
 Two-layer architecture:
@@ -275,6 +295,45 @@ Notes:
 | 7-9 | Validation | Implement strict CPU-vs-GPU mathematical parity tests, build CI-compatible fixture tests, and finalize benchmark harness to demonstrate optimized GPU speedup after memory-path improvements. | CI-ready parity test suite passing and benchmark script producing reproducible report artifacts for CPU/GPU/OpenCV comparison. |
 | 10-12 | Bubbaloop and Edge | Replace direct Bubbaloop app logic with the upstream kornia-rs API, deploy on NVIDIA Jetson Orin-class hardware, and publish final demo video with latency and throughput reporting. | End-to-end edge run validated on Jetson Orin-class device, final metrics table published, and upstream PR links consolidated in final report. |
 
+## Related Work and Competitive Analysis
+
+### Middleware and Edge Peers (Zenoh + Robotics)
+
+- [`NEWSLabNTU/ntu-zenoh_remote_driving`](https://github.com/NEWSLabNTU/ntu-zenoh_remote_driving): Zenoh-based camera streaming on Jetson-class edge hardware for remote driving.
+- [`eclipse-zenoh/zenoh-plugin-ros2dds`](https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds): Official ROS2 bridge used widely for ROS2 interoperability and distributed liveliness patterns.
+
+### GPU Backend Peers (CubeCL + WGPU)
+
+- [`tracel-ai/cubecl`](https://github.com/tracel-ai/cubecl): Core compute language/runtime ecosystem that underpins this backend direction.
+- [`rerun-io/rerun`](https://github.com/rerun-io/rerun): Strong Rust/WGPU reference for high-throughput real-time vision and robotics visualization.
+
+### BEV and IPM Peers (Math and Calibration)
+
+- [`ika-rwth-aachen/Cam2BEV`](https://github.com/ika-rwth-aachen/Cam2BEV): Multi-camera BEV workflow with deep-learning emphasis.
+- [`DrMahdiRezaei/Birds-Eye-View-Calibration`](https://github.com/DrMahdiRezaei/Birds-Eye-View-Calibration): Classical calibration and IPM toolkit in Python/OpenCV.
+
+### Comparative Positioning
+
+| Feature | Traditional Python/C++ Pipelines | Existing Zenoh Robotics Apps | This Project (Bubbaloop + kornia-rs target) |
+|---|---|---|---|
+| Language | Python or C++ | Rust app plus external GPU stacks | Pure Rust implementation path |
+| GPU Portability | Often CUDA/NVIDIA-only | Often DeepStream/TensorRT-centered | CubeCL/WGPU (Vulkan, Metal, DX12 capable) |
+| Middleware | Commonly ROS2-heavy | Zenoh-centric app logic | Zenoh integration plus reusable upstream backend |
+| Memory Strategy | Frequent per-frame allocations | App-specific optimizations | Persistent resources with VRAM reuse |
+| Reusability | Often standalone application code | Node-specific implementation | Upstream-oriented library contribution |
+
+### Why This Matters for kornia-rs
+
+- Converts app-level optimization into reusable backend infrastructure for the wider Rust CV ecosystem.
+- Reduces vendor lock-in by using portable GPU abstractions rather than CUDA-only assumptions.
+- Bridges low-latency middleware practice (Zenoh/Bubbaloop) with a hardware-agnostic vision backend.
+
+While projects like Cam2BEV provide similar transformations through Python/deep-learning
+pipelines, and Zenoh applications such as `ntu-zenoh_remote_driving` demonstrate low-latency
+transport, there is still a gap in reusable hardware-agnostic Rust implementations. This
+project fills that gap by upstreaming a pure-Rust CubeCL/WGPU backend into kornia-rs and
+validating it in a real Zenoh edge deployment.
+
 ## Proposal Success Criteria
 
 Per the Kornia-rs GSoC guidelines, this project defines success through two interconnected deliverables:
@@ -288,6 +347,15 @@ Per the Kornia-rs GSoC guidelines, this project defines success through two inte
 
 - **API PR:** Tensor-native warp perspective operation implemented and merged/reviewed in `kornia-imgproc`.
 - **Backend PR:** Hardware-agnostic `CubeCLBackend` integrated into kornia's dispatch system, utilizing persistent VRAM pooling to eliminate the memory-transfer bottlenecks identified in this repository's benchmark.
+
+## Risks and Mitigations
+
+- **Risk:** Host-device transfer overhead can dominate kernel gains.
+- **Mitigation:** Prioritize persistent buffers, reduce copies, and keep stage-level profiling active.
+- **Risk:** Upstream backend API mismatch with kornia-rs design expectations.
+- **Mitigation:** Open early focused PRs with small surface area and incorporate maintainer feedback incrementally.
+- **Risk:** Edge deployment variance across hardware/drivers.
+- **Mitigation:** Keep benchmark harness reproducible and publish transparent per-device metrics.
 
 ## Troubleshooting
 
@@ -311,6 +379,16 @@ In compliance with the GSoC 2026 AI Tooling Policy, the following outlines the u
 
 - **Usage:** LLMs were utilized for research, drafting documentation, and scaffolding boilerplate Rust code. AI was also used as a sparring partner to help identify and refactor concurrency bottlenecks (e.g., migrating to Tokio's `spawn_blocking` to resolve async thread starvation in the Bubbaloop nodes).
 - **Responsibility:** I have manually reviewed, profiled, and benchmarked every line of code in this repository. I take 100% responsibility for the architectural decisions, memory safety, correctness, and licensing of this submission.
+
+## References
+
+- https://github.com/AnilKumarSingh9856/bubbaloop-gpu-bev
+- https://github.com/NEWSLabNTU/ntu-zenoh_remote_driving
+- https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds
+- https://github.com/tracel-ai/cubecl
+- https://github.com/rerun-io/rerun
+- https://github.com/ika-rwth-aachen/Cam2BEV
+- https://github.com/DrMahdiRezaei/Birds-Eye-View-Calibration
 
 ## License
 
